@@ -1,0 +1,80 @@
+# =============================================================================
+# Hermes All-in-One v2 — compose（薄镜像 + 首启在线安装）
+# -----------------------------------------------------------------------------
+# 快速开始（推荐用 init.sh，它会把 --env-file 与各项检查都处理好）：
+#   cp config/.env.example config/.env      # 按需编辑
+#   docker compose --env-file config/.env up -d --build
+#
+# ⚠ 配置在 config/.env：compose 的 ${VAR} 插值只自动读「项目根 .env」，
+#   所以所有命令都要显式带 --env-file config/.env（init.sh 已自动加上）。
+#
+# 数据卷（升级与重建容器都不丢）：
+#   src/        → /app/src             hermes 源码 + webui 源码（hermes update 改这里）
+#   hermes-data/→ /app/hermes-agent    HERMES_HOME（依赖环境/工具/配置/会话）
+#   workspace/  → /workspace           Agent 默认工作区
+# =============================================================================
+
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: config/Dockerfile
+    image: hermes-allinone-v2:latest
+    container_name: hermes-allinone
+    restart: unless-stopped
+
+    env_file:
+      - config/.env
+
+    environment:
+      # 布局（与官方安装脚本约定的环境变量一致）
+      HERMES_HOME: /app/hermes-agent
+      HERMES_INSTALL_DIR: /app/src/Hermes
+      HERMES_WEBUI_DIR: /app/src/WebUI
+
+      # WebUI
+      HERMES_WEBUI_HOST: ${HERMES_WEBUI_HOST:-0.0.0.0}
+      HERMES_WEBUI_PORT: ${HERMES_WEBUI_PORT:-8787}
+      HERMES_WEBUI_BOT_NAME: ${HERMES_WEBUI_BOT_NAME:-Hermes}
+      HERMES_WEBUI_STATE_DIR: /app/hermes-agent/webui
+      HERMES_CONFIG_PATH: /app/hermes-agent/config.yaml
+
+      # 源码通道与更新节奏
+      HERMES_CHANNEL: ${HERMES_CHANNEL:-stable}
+      UPDATE_AGENT_TIME: ${UPDATE_AGENT_TIME:-48}
+      UPDATE_WEBUI_TIME: ${UPDATE_WEBUI_TIME:-48}
+
+      # Dashboard（可选）
+      HERMES_DASHBOARD_ON: ${HERMES_DASHBOARD_ON:-0}
+      HERMES_DASHBOARD_HOST: ${HERMES_DASHBOARD_HOST:-0.0.0.0}
+      HERMES_DASHBOARD_PORT: ${HERMES_DASHBOARD_PORT:-9119}
+      # ⚠ 只传我们自己的变量名。HERMES_DASHBOARD_BASIC_AUTH_USERNAME 若进到容器环境，
+      #   agent 会因“有 username 无 password”拒绝启动 → WebUI 打不开。
+      DASH_BASIC_AUTH_USER: ${DASH_BASIC_AUTH_USER:-hermes}
+
+      # 网关 / OpenAI 兼容端点（8642 必须可用）
+      HERMES_API_GW: ${HERMES_API_GW:-1}
+      API_SERVER_ENABLED: ${HERMES_API_GW:-1}
+      API_SERVER_HOST: ${API_SERVER_HOST:-0.0.0.0}
+      API_SERVER_PORT: ${API_SERVER_PORT:-8642}
+
+      # hindsight 插件（安装但不启用；用户用 dashboard 配置）
+      HINDSIGHT_PLUGIN: ${HINDSIGHT_PLUGIN:-on}
+      HINDSIGHT_ENABLE: ${HINDSIGHT_ENABLE:-0}
+
+      # 首启安装时是否跳过浏览器 / computer-use 组件（省时间与体积）
+      HERMES_SKIP_BROWSER: ${HERMES_SKIP_BROWSER:-0}
+      HERMES_SKIP_COMPUTER_USE: ${HERMES_SKIP_COMPUTER_USE:-0}
+
+    ports:
+      - "${HERMES_WEBUI_PORT:-8787}:${HERMES_WEBUI_PORT:-8787}"
+      - "${HERMES_DASHBOARD_PORT:-9119}:${HERMES_DASHBOARD_PORT:-9119}"
+      - "${API_SERVER_PORT:-8642}:${API_SERVER_PORT:-8642}"
+      - "${OPEN_PORT:-3111-3113}:${OPEN_PORT:-3111-3113}"
+
+    volumes:
+      - ${HOST_SRC_DIR:-./src}:/app/src
+      - ${HOST_HERMES_HOME:-./hermes-data}:/app/hermes-agent
+      - ${HOST_WORKSPACE:-./workspace}:/workspace
+
+    stop_grace_period: 30s

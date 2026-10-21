@@ -1,0 +1,8 @@
+# ── 运行时 / 部署产物（由 init.sh 或 docker 生成，不入库）──
+config/.env
+config/.logs/
+.env
+src/
+hermes-data/
+workspace/
+*.log
