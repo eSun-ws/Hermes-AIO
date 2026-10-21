@@ -1,7 +1,9 @@
 # =============================================================================
-# 构建上下文排除（BuildKit：本文件与 Dockerfile 同名同目录，且【完全覆盖】根的 .dockerignore）
-# 本镜像只需要 config/buildCMD/ 下的脚本；部署后 src/、hermes-data/、workspace/
-# 可能有几 GB 的源码与依赖，绝不能进构建上下文。
+# Build-context exclusions (BuildKit: this file shares the Dockerfile's name and
+# directory and COMPLETELY REPLACES the root .dockerignore).
+# The image only needs the scripts under config/buildCMD/; after a deployment
+# src/, hermes-data/ and workspace/ can hold gigabytes of sources and
+# dependencies, which must never enter the build context.
 # =============================================================================
 src/
 hermes-data/

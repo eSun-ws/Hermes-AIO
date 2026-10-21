@@ -1,18 +1,24 @@
 #!/bin/bash
 # =============================================================================
-# 首次启动引导（幂等）：把「真机安装流程」原样搬到容器里
+# First-boot bootstrap (idempotent): reproduces the bare-metal install flow inside
+# the container
 # -----------------------------------------------------------------------------
-# 顺序与真机一致：
-#   1) 官方安装脚本（尊重 HERMES_HOME / HERMES_INSTALL_DIR）→ 源码 + pm 环境
-#   2) WebUI：git clone 官方仓库（+ 预热 tags，避免“检测更新”15 秒超时）
-#   3) WebUI 运行环境：$INSTALL_DIR/venv（uv sync --locked，与 WebUI 的自动发现路径
-#      <agent_dir>/venv/bin/python 对齐），再把它装进同一个 venv
-#   4) 写 WebUI 的 .env（对齐 hermes 的路径/端口/密码）
-#   5) hindsight 插件（按需安装，不启用）
-# 全部完成后写 .bootstrap-done；之后每次启动只做“存在性检查”，秒过。
+# Same order as bare metal:
+#   1) official installer (honors HERMES_HOME / HERMES_INSTALL_DIR) -> sources + pm env
+#   2) WebUI: git clone the official repo (+ tag pre-warm, so the "check for updates"
+#      15-second timeout never triggers)
+#   3) WebUI runtime: $INSTALL_DIR/venv (uv sync --locked, aligned with the path the
+#      WebUI auto-discovers: <agent_dir>/venv/bin/python), then install the WebUI into
+#      that same venv
+#   4) write the WebUI .env (paths / port / password matching hermes)
+#   5) hindsight plugin (installed on demand, provider not activated)
+# When everything is done we write .bootstrap-done; later starts only run existence
+# checks and pass in milliseconds.
 #
-# 为什么 WebUI 单独一个 venv：pm 的依赖环境在 $HERMES_HOME/installs 下，`hermes update`
-# 会 `uv sync`（无 --inexact）修剪多余包 —— 把 WebUI 的依赖塞进 pm 环境会被剪掉。
+# Why the WebUI gets its own venv: pm keeps its environments under
+# $HERMES_HOME/installs and `hermes update` runs `uv sync` (without --inexact), which
+# prunes extraneous packages -- WebUI dependencies placed in the pm environment would
+# be deleted.
 # =============================================================================
 set -euo pipefail
 
@@ -32,11 +38,11 @@ die()  { echo "[bootstrap] ❌ $*" >&2; exit 1; }
 mkdir -p "$HERMES_HOME" "$INSTALL_DIR" "$WEBUI_DIR" "$HERMES_HOME/logs"
 LOG="$HERMES_HOME/logs/bootstrap.log"
 
-# ── 1) 官方安装脚本（源码 + pm 依赖环境）──────────────────────────────────────
+# ── 1) Official installer (sources + pm dependency environment) ────────────────
 if [ -d "$INSTALL_DIR/.git" ] && command -v hermes >/dev/null 2>&1; then
-    ok "hermes 已安装，跳过官方安装（$(hermes --version 2>/dev/null | head -1)）"
+    ok "hermes is already installed, skipping the official installer ($(hermes --version 2>/dev/null | head -1))"
 else
-    log "运行官方安装脚本（channel=$CHANNEL，HERMES_HOME=$HERMES_HOME，INSTALL_DIR=$INSTALL_DIR）"
+    log "Running the official installer (channel=$CHANNEL, HERMES_HOME=$HERMES_HOME, INSTALL_DIR=$INSTALL_DIR)"
     local_args=(--channel "$CHANNEL" --non-interactive)
     [ "${HERMES_SKIP_BROWSER:-0}" = "1" ] && local_args+=(--skip-browser)
     [ "${HERMES_SKIP_COMPUTER_USE:-0}" = "1" ] && local_args+=(--skip-computer-use)
@@ -44,82 +50,85 @@ else
     SCRIPT=/tmp/hermes-install.sh
     for i in 1 2 3; do
         if curl -fsSL -m 60 "$INSTALLER_URL" -o "$SCRIPT" && [ -s "$SCRIPT" ]; then break; fi
-        warn "下载安装脚本失败（第 $i 次），5s 后重试"; sleep 5
-        [ "$i" = 3 ] && die "无法下载官方安装脚本：$INSTALLER_URL"
+        warn "Downloading the installer failed (attempt $i), retrying in 5s"; sleep 5
+        [ "$i" = 3 ] && die "Cannot download the official installer: $INSTALLER_URL"
     done
 
-    log "安装脚本大小：$(wc -c <"$SCRIPT") 字节；开始安装（首次约 5-10 分钟）"
+    log "Installer size: $(wc -c <"$SCRIPT") bytes; starting the install (5-10 minutes on first run)"
     if ! HERMES_HOME="$HERMES_HOME" HERMES_INSTALL_DIR="$INSTALL_DIR" \
             bash "$SCRIPT" "${local_args[@]}" 2>&1 | tee -a "$LOG" | sed -u "s/^/[install] /"; then
-        die "官方安装脚本执行失败（完整日志：$LOG）"
+        die "The official installer failed (full log: $LOG)"
     fi
     command -v hermes >/dev/null 2>&1 || export PATH="${HOME:-/root}/.local/bin:$PATH"
-    command -v hermes >/dev/null 2>&1 || die "安装完成但找不到 hermes（检查 $HOME/.local/bin）"
-    ok "hermes 安装完成：$(hermes --version 2>/dev/null | head -1)"
+    command -v hermes >/dev/null 2>&1 || die "Install finished but hermes is not on PATH (check $HOME/.local/bin)"
+    ok "hermes installed: $(hermes --version 2>/dev/null | head -1)"
 fi
 
-# pm 托管 python（用于创建 WebUI 的 venv，保证与 agent 同一解释器版本）
+# pm-managed python (used to create the WebUI venv so both share one interpreter version)
 PM_PY="$(ls -d "$HERMES_HOME"/tools/python-3.*-linux-*/bin/python3 2>/dev/null | head -1 || true)"
-[ -n "$PM_PY" ] || die "找不到 pm 托管的 Python（$HERMES_HOME/tools），安装可能不完整"
+[ -n "$PM_PY" ] || die "Cannot find the pm-managed Python ($HERMES_HOME/tools); the install looks incomplete"
 
-# agent 仓库也预热一次 refs：WebUI 的「检测更新」对 agent 腿同样是 15s 硬超时，
-# 首启后第一次 fetch 实测 16.1s（刚好越界）、第二次 1.3s。这里先跑一次，让用户
-# 第一次点按钮就是热的（失败不阻断）。
+# Pre-warm the agent repo's refs as well: the WebUI's "check for updates" applies the
+# same hard-coded 15s timeout to the agent leg. Measured: the first fetch after first
+# boot takes 16.1s (just over the limit), the second 1.3s. Running it here means the
+# user's first button click is already warm (failure is not fatal).
 if [ -d "$INSTALL_DIR/.git" ]; then
-    log "预热 agent 仓库 refs（首次 fetch 约 15s）"
+    log "Pre-warming agent repo refs (first fetch takes ~15s)"
     git -C "$INSTALL_DIR" fetch --quiet --tags --force >/dev/null 2>&1 \
-        && log "agent refs 已预热" || warn "agent refs 预热失败（不影响安装，之后点更新会慢一次）"
+        && log "agent refs pre-warmed" || warn "agent refs pre-warm failed (harmless; the first update click will be slow once)"
 fi
 
-# ── 2) WebUI 源码（+ tags 预热）──────────────────────────────────────────────
+# ── 2) WebUI sources (+ tag pre-warm) ─────────────────────────────────────────
 if [ -d "$WEBUI_DIR/.git" ]; then
-    ok "WebUI 源码已存在：$(git -C "$WEBUI_DIR" rev-parse --short HEAD 2>/dev/null)"
+    ok "WebUI sources already present: $(git -C "$WEBUI_DIR" rev-parse --short HEAD 2>/dev/null)"
 else
-    log "克隆 WebUI 源码 → $WEBUI_DIR"
+    log "Cloning WebUI sources -> $WEBUI_DIR"
     rm -rf "$WEBUI_DIR"; mkdir -p "$WEBUI_DIR"
     for i in 1 2 3; do
         git clone --depth 1 https://github.com/nesquena/hermes-webui.git "$WEBUI_DIR" && break
-        warn "clone 失败（第 $i 次），5s 后重试"; sleep 5
-        [ "$i" = 3 ] && die "WebUI 克隆失败"
+        warn "clone failed (attempt $i), retrying in 5s"; sleep 5
+        [ "$i" = 3 ] && die "WebUI clone failed"
     done
-    ok "WebUI 克隆完成：$(git -C "$WEBUI_DIR" rev-parse --short HEAD)"
+    ok "WebUI cloned: $(git -C "$WEBUI_DIR" rev-parse --short HEAD)"
 fi
-# tags 预热：WebUI 的「检测更新」用 git fetch --tags，超时 15s（上游硬编码），
-# 浅克隆首次拉 1800+ tags 要 38s → 必然超时；预热后运行时 fetch ~1s。
+# Tag pre-warm: the WebUI's "check for updates" runs git fetch --tags with a 15s
+# timeout (hard-coded upstream); a shallow clone's first fetch of 1800+ tags needs
+# 38s, so it always times out. After the pre-warm the runtime fetch takes ~1s.
 if [ "$(git -C "$WEBUI_DIR" tag 2>/dev/null | wc -l)" -lt 100 ]; then
-    log "预热 WebUI tags（约 30-60s）"
+    log "Pre-warming WebUI tags (30-60s)"
     for i in 1 2 3; do
         git -C "$WEBUI_DIR" fetch --tags --depth 1 origin >/dev/null 2>&1 && break
-        warn "tags 预热失败（第 $i 次）"; sleep 5
+        warn "tag pre-warm failed (attempt $i)"; sleep 5
     done
-    log "WebUI tags：$(git -C "$WEBUI_DIR" tag | wc -l)"
+    log "WebUI tags: $(git -C "$WEBUI_DIR" tag | wc -l)"
 fi
 
-# ── 3) WebUI 运行环境（$INSTALL_DIR/venv，与 WebUI 自动发现路径一致）─────────
-# 判据要同时覆盖两侧依赖：只看 run_agent 会漏掉 WebUI 自己的运行库
-# （fastapi / uvicorn / ruamel.yaml），现象是 server.py 启动即死、日志空白。
+# ── 3) WebUI runtime ($INSTALL_DIR/venv, matching the WebUI's auto-discovery) ──
+# The probe must cover both sides: checking run_agent alone misses the WebUI's own
+# runtime libraries (fastapi / uvicorn / ruamel.yaml), and the symptom is server.py
+# dying on startup with an empty log.
 webui_env_ok() {
     "$VENV/bin/python" -c "import run_agent, fastapi, uvicorn, ruamel.yaml" >/dev/null 2>&1
 }
 if [ -x "$VENV/bin/python" ] && webui_env_ok; then
-    ok "WebUI 运行环境已就绪（$VENV）"
+    ok "WebUI runtime already ready ($VENV)"
 else
-    log "构建 WebUI 运行环境（uv sync --locked，含 python-olm 源码编译，约 3-6 分钟）"
+    log "Building the WebUI runtime (uv sync --locked, includes the python-olm source build, 3-6 minutes)"
     UV_BIN="$(command -v uv || ls -d "$HERMES_HOME"/tools/uv-*/bin/uv "$HERMES_HOME"/tools/uv-*/uv 2>/dev/null | head -1 || true)"
-    [ -x "$UV_BIN" ] || die "找不到 uv（官方安装应把它放到 ~/.local/bin）"
+    [ -x "$UV_BIN" ] || die "Cannot find uv (the official installer should place it in ~/.local/bin)"
     [ -x "$VENV/bin/python" ] || "$PM_PY" -m venv "$VENV"
     (
         cd "$INSTALL_DIR"
         UV_PROJECT_ENVIRONMENT="$VENV" "$UV_BIN" sync --locked --python 3.14 \
             $(python3 -c "import tomllib;o=tomllib.load(open('pyproject.toml','rb'))['project'].get('optional-dependencies',{});w=['all','messaging','otlp','anthropic','bedrock','azure-identity','matrix'];print(' '.join('--extra '+e for e in w if e in o))") \
-            || { warn "uv sync 失败，回退为 pip 安装"; "$VENV/bin/python" -m pip install --quiet -e "$INSTALL_DIR"; }
-        "$VENV/bin/python" -m pip install --quiet -e "$WEBUI_DIR" || warn "WebUI 依赖安装失败（稍后由本地 venv 兜底）"
+            || { warn "uv sync failed, falling back to pip"; "$VENV/bin/python" -m pip install --quiet -e "$INSTALL_DIR"; }
+        "$VENV/bin/python" -m pip install --quiet -e "$WEBUI_DIR" || warn "Installing WebUI dependencies failed (the local venv covers it later)"
     ) 2>&1 | tee -a "$LOG" | sed -u "s/^/[venv]    /"
     "$VENV/bin/python" -c "import run_agent, cryptography" >/dev/null 2>&1 \
-        && ok "WebUI 运行环境就绪" || die "WebUI 运行环境构建失败（日志：$LOG）"
+        && ok "WebUI runtime ready" || die "Building the WebUI runtime failed (log: $LOG)"
 fi
 
-# ── 4) WebUI 的 .env（对齐 hermes 路径/端口/密码）────────────────────────────
+# ── 4) WebUI .env (paths / port / password matching hermes) ───────────────────
 ENV_FILE="$WEBUI_DIR/.env"
 touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
 upsert() {  # upsert KEY VALUE
@@ -138,21 +147,24 @@ upsert HERMES_WEBUI_BOT_NAME   "${HERMES_WEBUI_BOT_NAME:-Hermes}"
 upsert HERMES_CONFIG_PATH      "$HERMES_HOME/config.yaml"
 upsert HERMES_HOME             "$HERMES_HOME"
 [ -n "${HERMES_WEBUI_PASSWORD:-}" ] && upsert HERMES_WEBUI_PASSWORD "$HERMES_WEBUI_PASSWORD"
-ok "WebUI 配置就绪：$ENV_FILE"
+ok "WebUI configuration ready: $ENV_FILE"
 
 
-# ── 4.5) WebUI 设置：默认不让它去检测/更新 agent ─────────────────────────────
-# 为什么必须在这里做：
-#   · 上游 WebUI 的更新按钮对 agent 腿把 channel 强制成 stable，但随后的
-#     `_select_apply_compare_ref()` 会“分支兜底”到 `git pull --ff-only origin/main`
-#     —— 即按开发线拉，完全绕过 agent 自己的通道设置（实测会从 v0.22.2 跳到
-#     rc.5-v0.22.3-1-g69c7d677a1，领先 3017 个提交）。
-#   · 想让它“跟随 Hermes 的版本线”必须改 vendor 代码（`api/updates.py`），会在
-#     WebUI 自身升级时被覆盖，不可持续。
-#   · 上游没有提供 env 开关，唯一受支持的开关是 settings.json 的
-#     `ignore_agent_updates`（Settings 里叫 “Ignore Agent updates”）。
-# 所以默认打开它：WebUI 只检查/更新自己，agent 一律由 `hermes update`（stable，48h 定时）驱动。
-# 变量 WEBUI_IGNORE_AGENT_UPDATES=1 开启（默认），=0 则恢复 WebUI 也会检查 agent。
+# ── 4.5) WebUI settings: do not let it check/update the agent by default ──────
+# Why this has to happen here:
+#   * The upstream WebUI update button pins the agent leg to the stable channel, but
+#     `_select_apply_compare_ref()` then falls through to
+#     `git pull --ff-only origin/main` -- i.e. it pulls the development line and
+#     completely bypasses the agent's own channel setting (measured: v0.22.2 jumps to
+#     rc.5-v0.22.3-1-g69c7d677a1, 3017 commits ahead).
+#   * Making it "follow Hermes' release line" requires patching vendor code
+#     (`api/updates.py`), which the next WebUI update overwrites -- not sustainable.
+#   * Upstream exposes no environment switch; the only supported one is
+#     `ignore_agent_updates` in settings.json (called "Ignore Agent updates" in Settings).
+# So we turn it on by default: the WebUI only checks/updates itself and the agent is
+# driven exclusively by `hermes update` (stable, 48h schedule).
+# WEBUI_IGNORE_AGENT_UPDATES=1 enables it (default); =0 restores upstream behaviour
+# where the WebUI also checks the agent.
 seed_webui_settings() {
     local want="${WEBUI_IGNORE_AGENT_UPDATES:-1}"
     local dir="${HERMES_WEBUI_STATE_DIR:-$HERMES_HOME/webui}"
@@ -173,28 +185,31 @@ if p.exists():
     except Exception:
         data = {}
 if data.get("ignore_agent_updates") is want:
-    print("[bootstrap] WebUI 设置已是 ignore_agent_updates=%s" % want)
+    print("[bootstrap] WebUI setting already is ignore_agent_updates=%s" % want)
     sys.exit(0)
 data["ignore_agent_updates"] = want
 tmp = p.with_name(p.name + ".tmp")
 tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 os.replace(tmp, p)
-print("[bootstrap] 已写入 WebUI 设置 ignore_agent_updates=%s → %s" % (want, p))
+print("[bootstrap] Wrote WebUI setting ignore_agent_updates=%s -> %s" % (want, p))
 PYSEED
 }
 
 seed_webui_settings
 
-# ── 5) hindsight 插件（源码 + 依赖分开处理）──────────────────────────────────
-# ⚠ 实测关键事实：
-#   1) `hermes plugins install` 只克隆插件源码，**不装 Python 依赖**；插件声明的
-#      hindsight-client / hindsight-embed（约 400 MB）是在 `hermes plugins enable`
-#      时才被创建到 installs/<key>/environments/<hash>/venv。传 --no-enable 会让
-#      Dashboard 永远显示 "Install provider dependencies"。
-#   2) 不能用 `installs/*/environments` 判断"已安装"——那是 agent 自己的环境，恒存在。
-#      正确判据：某个环境里能否 import hindsight_client。
-#   3) `plugins enable` 只启用插件，不写 memory.provider；provider 仍由用户在
-#      Dashboard 里选择（保持"装好但不激活"）。
+# ── 5) hindsight plugin (source and dependencies handled separately) ──────────
+# WARNING -- measured facts:
+#   1) `hermes plugins install` only clones the plugin source and does **not** install
+#      Python dependencies. The declared hindsight-client / hindsight-embed (~400 MB)
+#      are created under installs/<key>/environments/<hash>/venv only when
+#      `hermes plugins enable` runs. Passing --no-enable leaves the Dashboard showing
+#      "Install provider dependencies" forever.
+#   2) Do not use `installs/*/environments` to decide "already installed" -- that is
+#      the agent's own environment and always exists. Correct probe: can some
+#      environment `import hindsight_client`.
+#   3) `plugins enable` only enables the plugin and never writes memory.provider; the
+#      provider is still chosen by the user in the Dashboard (stays "installed but not
+#      activated").
 hindsight_deps_ready() {
     local py
     for py in "$HERMES_HOME"/installs/*/environments/*/venv/bin/python; do
@@ -205,34 +220,35 @@ hindsight_deps_ready() {
 }
 
 if [ "${HINDSIGHT_PLUGIN:-on}" = "off" ]; then
-    log "HINDSIGHT_PLUGIN=off，跳过 hindsight 插件"
+    log "HINDSIGHT_PLUGIN=off, skipping the hindsight plugin"
 else
     if [ -d "$HERMES_HOME/plugins/hindsight" ]; then
-        ok "hindsight 插件源码已存在"
+        ok "hindsight plugin source already present"
     else
-        log "安装 hindsight 插件源码（仅克隆）"
+        log "Installing the hindsight plugin source (clone only)"
         if hermes plugins install hindsight --yes-deps --no-enable >>"$LOG" 2>&1; then
-            ok "hindsight 插件源码就位"
+            ok "hindsight plugin source in place"
         else
-            warn "hindsight 插件安装失败（稍后可重试：hermes plugins install hindsight）"
+            warn "hindsight plugin install failed (retry later: hermes plugins install hindsight)"
         fi
     fi
 
-    # 依赖：HINDSIGHT_PREPARE（旧名 HINDSIGHT_ENABLE 仍兼容），默认 1 = 首启就装好
+    # Dependencies: HINDSIGHT_PREPARE (legacy name HINDSIGHT_ENABLE still honored),
+    # default 1 = install them during first boot
     PREPARE="${HINDSIGHT_PREPARE:-${HINDSIGHT_ENABLE:-1}}"
     if hindsight_deps_ready; then
-        ok "hindsight 依赖已就绪"
+        ok "hindsight dependencies already present"
     elif [ "$PREPARE" = "1" ]; then
-        log "准备 hindsight 依赖（plugins enable，约 400MB / 数分钟）"
+        log "Preparing hindsight dependencies (plugins enable, ~400MB / a few minutes)"
         if hermes plugins enable hindsight >>"$LOG" 2>&1 && hindsight_deps_ready; then
-            ok "hindsight 依赖就绪"
+            ok "hindsight dependencies ready"
         else
-            warn "hindsight 依赖未装好：可在 Dashboard 点 “Install provider dependencies”，或执行 hermes plugins enable hindsight"
+            warn "hindsight dependencies are not ready: click \"Install provider dependencies\" in the Dashboard, or run hermes plugins enable hindsight"
         fi
     else
-        log "HINDSIGHT_PREPARE=0：跳过依赖安装（首次启用时由 Dashboard 提示安装）"
+        log "HINDSIGHT_PREPARE=0: skipping dependency install (the Dashboard offers it on first enable)"
     fi
 fi
 
 date '+%F %T' > "$DONE_FLAG"
-ok "首次引导完成（标记：$DONE_FLAG）"
+ok "First-boot bootstrap complete (marker: $DONE_FLAG)"

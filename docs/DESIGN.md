@@ -1,65 +1,74 @@
-# v2 设计说明：把"真机安装流程"搬进容器
+# v2 design notes: bringing the bare-metal install flow into a container
 
-## 1. 为什么这么做
+## 1. Why this approach
 
-v1 的做法是"构建期把源码和 venv 烤进镜像"，代价是 7.53 GB、上游一变就构建失败、
-且 `hermes update` 的语义与真机不同（自建版本戳、pm 不认这套布局）。
+v1 baked the sources and the venv into the image at build time. That cost 7.53 GB, broke the build
+whenever upstream moved, and gave `hermes update` different semantics than a bare-metal install
+(a hand-written version stamp that pm did not recognize).
 
-v2 反过来：**镜像只提供 OS + 工具链 + 流程脚本（1.36 GB），hermes 与 WebUI 在首启时用官方脚本在线安装。**
-好处是每次装机拿到的就是最新版、升级路径与真机完全一致（`hermes update` / 两个更新按钮都能用）。
+v2 inverts it: **the image only provides the OS, the toolchain and the orchestration scripts
+(1.36 GB); hermes and the WebUI are installed online by the official installer on first boot.**
+Every deployment therefore gets the current release, and the upgrade path is identical to bare metal
+(`hermes update` and both update buttons work).
 
-## 2. 官方安装后的真实布局（决定了全部设计）
+## 2. The real layout produced by the official installer (this drives every decision)
 
 ```
-$INSTALL_DIR/.hermes/bin/hermes      → 垫片：exec $HERMES_HOME/tools/python-3.x/bin/python3 -I -c '...'
-$HERMES_HOME/tools/                  → uv 托管的 Python、uv、node 等
-$HERMES_HOME/installs/<key>/         → pm 的依赖环境（environments/<key>/venv）+ facts.json
-$HOME/.local/bin/hermes              → 同上（PATH 入口）
-$HOME/.local/share/uv/               → uv 的 Python 解释器本体
+$INSTALL_DIR/.hermes/bin/hermes      -> shim: exec $HERMES_HOME/tools/python-3.x/bin/python3 -I -c '...'
+$HERMES_HOME/tools/                  -> uv-managed Python, uv, node, ...
+$HERMES_HOME/installs/<key>/         -> pm dependency environments (environments/<key>/venv) + facts.json
+$HOME/.local/bin/hermes              -> same shim (the PATH entry point)
+$HOME/.local/share/uv/               -> the uv-managed Python interpreters themselves
 ```
 
-由此推出三件事（都是实测出来的）：
+Three consequences follow (all measured):
 
-1. **`HERMES_HOME` 不能是空数据卷**。垫片里是写死的绝对路径，卷为空时直接
-   `exec: ...python3: not found`，**不会自举**。所以首启必须先跑安装脚本。
-2. **`HOME` 必须进数据卷**。垫片与 uv 的 Python 都在 `$HOME/.local` 下——留在 `/root`
-   （镜像层）时，容器一重建就全丢，`$INSTALL_DIR/venv` 里的 python 变悬空链接，WebUI 起不来。
-   这就是本项目的 `HOME=/app/hermes-agent/home`。
-3. **WebUI 需要自己的环境**。pm 的 `uv sync` 不带 `--inexact`，会把不在 lock 里的包**修剪掉**，
-   所以 WebUI 的依赖（fastapi/uvicorn/ruamel/PyYAML）不能塞进 pm 环境，否则下次 `hermes update`
-   就被删了。v2 用 `$INSTALL_DIR/venv`（`uv sync --locked` + `pip install -e WebUI`），
-   正好命中 WebUI 的自动发现优先级 2（`<agent_dir>/venv/bin/python`）。
+1. **`HERMES_HOME` cannot be an empty data volume.** The shim contains hard-coded absolute paths; with
+   an empty volume it fails outright with `exec: ...python3: not found` and **does not bootstrap
+   itself**. That is why first boot has to run the installer.
+2. **`HOME` must live on a data volume.** Both the shim and uv's Python live under `$HOME/.local`. If
+   `HOME` stays in the image layer (`/root`), recreating the container wipes them, the interpreter
+   referenced by `$INSTALL_DIR/venv` becomes a dangling symlink, and the WebUI cannot start. Hence
+   this project sets `HOME=/app/hermes-agent/home`.
+3. **The WebUI needs its own environment.** pm's `uv sync` runs without `--inexact`, so it **prunes**
+   packages that are not in the lock file. WebUI dependencies (fastapi/uvicorn/ruamel/PyYAML)
+   therefore cannot live in the pm environment — the next `hermes update` would delete them. v2 uses
+   `$INSTALL_DIR/venv` (`uv sync --locked` + `pip install -e WebUI`), which happens to be exactly
+   WebUI's auto-discovery priority 2 (`<agent_dir>/venv/bin/python`).
 
-## 3. 进程模型（等价真机的两个 systemd 单元）
+## 3. Process model (equivalent to the two systemd units on bare metal)
 
-| 真机 | 容器 |
+| Bare metal | Container |
 |---|---|
 | `hermes-gateway.service` | `supervisor.sh` → `hermes gateway run --no-supervise --external-supervisor` |
-| `hermes-webui.service`（`After=hermes-gateway`、`Restart=always`、`RestartSec=5`） | 先起网关、再起 WebUI；进程退出 5 秒后重拉 |
-| 48h 任务计划 | `updater.sh`（`UPDATE_AGENT_TIME` / `UPDATE_WEBUI_TIME`） |
-| 更新后"能打开但不能对话" | supervisor **盯 HEAD**：commit 变了就刷依赖 + 重启 WebUI/网关 |
+| `hermes-webui.service` (`After=hermes-gateway`, `Restart=always`, `RestartSec=5`) | start the gateway first, then the WebUI; relaunch 5 seconds after a process exits |
+| the 48h scheduled task | `updater.sh` (`UPDATE_AGENT_TIME` / `UPDATE_WEBUI_TIME`) |
+| "opens but cannot chat" after an update | the supervisor **watches HEAD**: when the commit changes it refreshes dependencies and restarts the WebUI/gateway |
 
-`--external-supervisor` 是必须的：否则 `hermes gateway run` 会 detach 成守护后前台退出，
-supervisor 会误判崩溃并陷入重启循环。
+`--external-supervisor` is mandatory: without it `hermes gateway run` detaches into a daemon and the
+foreground process exits, so the supervisor would treat that as a crash and loop forever.
 
-## 4. 踩过的坑（都已在代码里兜住）
+## 4. Pitfalls hit (all handled in the code)
 
-| 坑 | 现象 | 修法 |
+| Pitfall | Symptom | Fix |
 |---|---|---|
-| `HOME` 在镜像层 | 重建容器后 `venv/bin/python` 悬空、WebUI 起不来、重新走安装 | `HOME` 指向数据卷 `home/` |
-| `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` 进容器环境 | agent 报 `neither password_hash nor password is configured` **直接拒绝启动** | 用自有变量 `DASH_BASIC_AUTH_USER`；启用 Dashboard 时用 `hermes config set` 成对写 username+hash |
-| `[ 条件 ] \|\| return` + `set -e` | 条件不成立时 `return` 继承状态 1 → PID 1 退出 → 容器 exit 0 重启循环 | 所有提前返回都写 `return 0` |
-| WebUI 依赖判据只看 `run_agent` | 走"已就绪"快路径 → `server.py` 启动即死、日志空白 | 判据补齐 `fastapi, uvicorn, ruamel.yaml` |
-| 首启日志 `tee \| tail -n 40` | 安装 10 分钟期间 `docker logs` 一片空白 | 改 `sed -u` 流式输出 |
-| 浅克隆只有 1 个 tag | WebUI 检测更新 `git fetch --tags` 超过硬编码 15s → 报超时 | 首启预热 tags（~30s），运行时 ~1s |
-| WebUI 的 agent 更新腿 | 上游把 channel 钉成 stable，但 `_select_apply_compare_ref()` 对 agent 会"分支兜底"到 `origin/main` → 点一次更新就把 agent 拉到开发线（实测 v0.22.2 → rc.5-v0.22.3-1，+3017 提交），与 WebUI 版本线错位；且没有 env 开关 | 默认写 `ignore_agent_updates: true`（`WEBUI_IGNORE_AGENT_UPDATES=1`），两条腿解耦：agent 只由 `hermes update`（stable）驱动 |
-| 重复运行 init.sh | 两个实例互相 `up -d` → 容器反复重建（SIGTERM） | 用 `-pw`/检查步避免并发；`--force` 才重建 |
-| hindsight 依赖"装完了"的假象 | `plugins install --yes-deps` **只拉插件源码**；配 `--no-enable` 时依赖永不安装 → Dashboard 永久显示 “Install provider dependencies / Python dependencies”（后端 `pm.venv_is_current()` 为假） | 先 `install` 拿源码，再 `plugins enable`（≈400 MB）建隔离环境装依赖；判据用「某环境能否 `import hindsight_client`」，**不能**用 `installs/*/environments`（那是 agent 自己的环境，恒存在） |
+| `HOME` in the image layer | after recreating the container `venv/bin/python` dangles, the WebUI will not start, the installer runs again | point `HOME` at the `home/` directory on the data volume |
+| `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` in the container environment | the agent reports `neither password_hash nor password is configured` and **refuses to start** | use our own variable `DASH_BASIC_AUTH_USER`; when enabling the Dashboard, write username+hash as a pair via `hermes config set` |
+| `[ cond ] \|\| return` combined with `set -e` | when the condition is false `return` inherits status 1 → PID 1 exits → the container restarts (exit 0) in a loop | every early return is written as `return 0` |
+| WebUI readiness probe only checking `run_agent` | the "already ready" fast path is taken → `server.py` dies on startup and the log stays empty | probe `fastapi, uvicorn, ruamel.yaml` as well |
+| first-boot logging through `tee \| tail -n 40` | `docker logs` stays blank for the 10 minutes of installation | stream with `sed -u` instead |
+| a shallow clone has a single tag | the WebUI update check runs `git fetch --tags`, exceeds the hard-coded 15s and reports a timeout | pre-warm tags on first boot (~30s), then ~1s at runtime |
+| the WebUI's agent update leg | upstream pins the channel to stable, but `_select_apply_compare_ref()` falls through to the branch for the agent repo (`origin/main`) → one click drags the agent onto the development line (measured v0.22.2 → rc.5-v0.22.3-1, +3017 commits), out of step with the WebUI; there is no env switch | write `ignore_agent_updates: true` by default (`WEBUI_IGNORE_AGENT_UPDATES=1`) so the two legs are decoupled: the agent is driven only by `hermes update` (stable) |
+| running `init.sh` twice concurrently | two instances `up -d` over each other → the container is recreated repeatedly (SIGTERM) | use `-pw`/the check step to avoid concurrency; only `--force` recreates |
+| the illusion that hindsight dependencies are "installed" | `plugins install --yes-deps` **only clones the plugin source**; with `--no-enable` the dependencies are never installed → the Dashboard shows "Install provider dependencies / Python dependencies" forever (backend `pm.venv_is_current()` is false) | `install` for the source first, then `plugins enable` (≈400 MB) to create the isolated environment and install dependencies; probe with "can some environment `import hindsight_client`", **never** with `installs/*/environments` (that is the agent's own environment and always exists) |
 
-## 5. 已知限制
+## 5. Known limitations
 
-- **API/WebUI 的"更新"仍受网速约束**：WebUI 的 `git fetch` 超时 15 秒是上游**硬编码**（`api/updates.py` 三处），
-  没有环境变量可调。线路到 GitHub 超过 15 秒的机器（实测某机房 22–36 s）会报 `timed out`；
-  这是网络问题，官方安装流程同样会遇到，不是本项目引入的。可给该容器配代理或改用 CLI `hermes update`。
-- **无 GPU 支持**：v2 目前是 CPU-only（v1 的 `config/hwaccel.yaml` 可移植过来）。
-- **无 systemd**：用 supervisor 复刻语义；容器内不要执行 `systemctl` 相关命令。
+- **API/WebUI updates are still bounded by network speed.** The 15-second `git fetch` timeout in the
+  WebUI is **hard-coded** upstream (three call sites in `api/updates.py`) with no environment variable
+  to tune it. Hosts whose path to GitHub exceeds 15 seconds (measured 22-36 s on one site) report
+  `timed out`. This is a network problem that the official install flow hits as well; it is not
+  introduced by this project. Options: give that container a proxy, or use the CLI `hermes update`.
+- **No GPU support.** v2 is CPU-only for now (v1's `config/hwaccel.yaml` can be ported over).
+- **No systemd.** The supervisor reproduces the unit semantics; do not run `systemctl` commands inside
+  the container.

@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
-# 入口：凭据 → 首启引导（在线安装）→ 交给 supervisor
-#   模式：up（默认）/ bootstrap / webui / gateway / dashboard / bash
+# Entrypoint: credentials -> first-boot bootstrap (online install) -> supervisor
+#   modes: up (default) / bootstrap / webui / gateway / dashboard / bash
 # =============================================================================
 set -euo pipefail
 
@@ -25,7 +25,7 @@ upsert_env() {  # upsert_env KEY VALUE [FILE]
     fi
 }
 
-# ── 凭据：主密码（WebUI/Dashboard 共用）+ API key（官方要求 ≥16 位）──────────
+# ── Credentials: master password (shared by WebUI/Dashboard) + API key (>=16 chars)
 ensure_credentials() {
     local env_file="$HERMES_HOME/.env" master="" val api_key=""
     val="${HERMES_WEBUI_PASSWORD:-}"
@@ -36,7 +36,7 @@ ensure_credentials() {
     fi
     if [ -z "$master" ]; then
         master="$(openssl rand -hex 16 2>/dev/null || tr -dc 'a-f0-9' </dev/urandom | head -c 32)"
-        log "首次运行：已自动生成主密码"
+        log "First run: generated a master password"
     fi
 
     api_key="${API_SERVER_KEY:-}"
@@ -48,7 +48,7 @@ ensure_credentials() {
             api_key="$master"
         else
             api_key="$(openssl rand -hex 16 2>/dev/null || tr -dc 'a-f0-9' </dev/urandom | head -c 32)"
-            log "主密码 ${#master} 位 < 16：API 网关要求 key ≥16 位，已单独生成 API key"
+            log "Master password is ${#master} chars (< 16): the API gateway needs a key of at least 16, so a separate API key was generated"
         fi
     fi
 
@@ -60,55 +60,57 @@ ensure_credentials() {
 
     echo ""
     echo "================================================================"
-    echo " [entrypoint] 登录凭据："
-    echo "   WebUI      http://<host>:${HERMES_WEBUI_PORT:-8787}    密码: ${master}"
+    echo " [entrypoint] login credentials:"
+    echo "   WebUI      http://<host>:${HERMES_WEBUI_PORT:-8787}    password: ${master}"
     if [ "${HERMES_DASHBOARD_ON:-0}" = "1" ]; then
-        echo "   Dashboard  http://<host>:${HERMES_DASHBOARD_PORT:-9119} 用户: ${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:-hermes}  密码: ${master}"
+        echo "   Dashboard  http://<host>:${HERMES_DASHBOARD_PORT:-9119} user: ${DASH_BASIC_AUTH_USER:-hermes}  password: ${master}"
     fi
     if [ "$api_key" = "$master" ]; then
-        echo "   API 网关   http://<host>:${API_SERVER_PORT:-8642}/v1   Key: ${api_key}（= 主密码）"
+        echo "   API gateway http://<host>:${API_SERVER_PORT:-8642}/v1   key: ${api_key} (= master password)"
     else
-        echo "   API 网关   http://<host>:${API_SERVER_PORT:-8642}/v1   Key: ${api_key}（独立 key，主密码不足 16 位）"
+        echo "   API gateway http://<host>:${API_SERVER_PORT:-8642}/v1   key: ${api_key} (separate key; master password under 16 chars)"
     fi
-    echo "   已持久化到 $env_file"
+    echo "   persisted to $env_file"
     echo "================================================================"
     echo ""
 }
 
-# Dashboard 绑定 0.0.0.0 需要 config.yaml 里【同时】有 username 与 password_hash。
-# ⚠ 只写 username 会让 agent 拒绝启动（"neither password_hash nor password is
-#   configured"）→ WebUI 打不开。所以一律成对写入，并且走官方 `hermes config set`，
-#   不手改 YAML（避免破坏既有结构与注释）。
+# A Dashboard bound to 0.0.0.0 needs BOTH a username and a password_hash in
+# config.yaml. WARNING: writing only the username makes the agent refuse to start
+# ("neither password_hash nor password is configured") and the WebUI will not open.
+# So they are always written as a pair, through the official `hermes config set`
+# (never by hand-editing YAML, which would disturb the existing structure/comments).
 ensure_dashboard_auth() {
     [ "${HERMES_DASHBOARD_ON:-0}" = "1" ] || return 0
     [ -f "$HERMES_HOME/config.yaml" ] || return 0
     grep -qE "^[[:space:]]+password_hash:[[:space:]]*[^[:space:]]" "$HERMES_HOME/config.yaml" 2>/dev/null && return 0
     local user="${DASH_BASIC_AUTH_USER:-hermes}"
     local pass="${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:-${HERMES_WEBUI_PASSWORD:-}}"
-    [ -n "$pass" ] || { log "WARNING: 没有可用密码，跳过 dashboard 鉴权写入"; return 0; }
+    [ -n "$pass" ] || { log "WARNING: no usable password, skipping the dashboard auth write"; return 0; }
     local hash
     hash="$("$VENV" -c 'import sys; from plugins.dashboard_auth.basic import hash_password; print(hash_password(sys.argv[1]))' "$pass" 2>/dev/null || true)"
-    [ -n "$hash" ] || { log "WARNING: 无法计算 password_hash（跳过）"; return 0; }
+    [ -n "$hash" ] || { log "WARNING: could not compute password_hash (skipping)"; return 0; }
     hermes config set dashboard.basic_auth.username "$user" >>"$LOG_DIR/dashboard-auth.log" 2>&1 || true
     hermes config set dashboard.basic_auth.password_hash "$hash" >>"$LOG_DIR/dashboard-auth.log" 2>&1 || true
     if grep -qE "^[[:space:]]+password_hash:[[:space:]]*[^[:space:]]" "$HERMES_HOME/config.yaml"; then
-        log "dashboard.basic_auth 已写入（user=$user）"
+        log "dashboard.basic_auth written (user=$user)"
     else
-        log "WARNING: dashboard.basic_auth 写入失败（见 $LOG_DIR/dashboard-auth.log）"
+        log "WARNING: writing dashboard.basic_auth failed (see $LOG_DIR/dashboard-auth.log)"
     fi
 }
 
-# 更新中断留下的标记/锁：没有 update 进程在跑就是脏数据，直接清掉。
-# ⚠ 不清的话，WebUI/Dashboard 的更新按钮一旦中断（断网、容器重启），后续
-#   `hermes` 子命令可能卡在 "waiting for ... lock" 或反复续做，表现就是
-#   “WebUI 能打开但不能对话”。
+# Markers/locks left behind by an interrupted update: with no update process running
+# they are stale and removed. WARNING: if they are left in place, an interrupted
+# WebUI/Dashboard update (network loss, container restart) can make later `hermes`
+# commands hang on "waiting for ... lock" or keep resuming, which shows up as
+# "the WebUI opens but cannot chat".
 heal_update_markers() {
     pgrep -fa "hermes update" >/dev/null 2>&1 && return 0
     local f removed=0
     for f in "$HERMES_HOME/.hermes-update-in-progress" "$HERMES_HOME/.hermes-update-in-progress.lock"; do
         if [ -e "$f" ]; then rm -f "$f"; removed=$((removed + 1)); fi
     done
-    [ "$removed" -gt 0 ] && log "已清理 $removed 个更新残留标记（无 update 进程在运行）"
+    [ "$removed" -gt 0 ] && log "Removed $removed stale update marker(s) (no update process running)"
     return 0
 }
 
@@ -123,15 +125,15 @@ case "$MODE" in
         heal_update_markers
         ensure_credentials
         ensure_dashboard_auth
-        log "首启引导检查（首次会在线安装 hermes + webui，约 5-15 分钟，进度见下方）"
-        /app/scripts/bootstrap.sh || { log "ERROR: 首启引导失败，容器保持运行以便排查（docker exec -it <容器> bash）"; exec sleep infinity; }
-        ensure_dashboard_auth   # config.yaml 由安装脚本生成，装完再写一次
+        log "First-boot check (the first run installs hermes + webui online, 5-15 minutes; progress below)"
+        /app/scripts/bootstrap.sh || { log "ERROR: first-boot bootstrap failed; keeping the container alive for inspection (docker exec -it <container> bash)"; exec sleep infinity; }
+        ensure_dashboard_auth   # config.yaml is created by the installer, so write once more afterwards
         case "$MODE" in
-            up)         log "启动 supervisor（gateway + webui + 定时更新）"; exec /app/scripts/supervisor.sh ;;
-            webui)      log "仅启动 WebUI"; exec /app/scripts/supervisor.sh ;;   # supervisor 内部按开关裁剪
-            gateway)    log "仅启动网关"; exec hermes gateway run --external-supervisor ;;
-            dashboard)  log "启动 Dashboard"; exec hermes dashboard --host 0.0.0.0 --port "${HERMES_DASHBOARD_PORT:-9119}" --skip-build --no-open ;;
-            *)          log "未知模式：$MODE（可用 up/bootstrap/webui/gateway/dashboard/bash）"; exec sleep infinity ;;
+            up)         log "Starting the supervisor (gateway + webui + scheduled updates)"; exec /app/scripts/supervisor.sh ;;
+            webui)      log "Starting the WebUI only"; exec /app/scripts/supervisor.sh ;;   # the supervisor trims services by switches
+            gateway)    log "Starting the gateway only"; exec hermes gateway run --external-supervisor ;;
+            dashboard)  log "Starting the Dashboard"; exec hermes dashboard --host 0.0.0.0 --port "${HERMES_DASHBOARD_PORT:-9119}" --skip-build --no-open ;;
+            *)          log "Unknown mode: $MODE (available: up/bootstrap/webui/gateway/dashboard/bash)"; exec sleep infinity ;;
         esac
         ;;
 esac
